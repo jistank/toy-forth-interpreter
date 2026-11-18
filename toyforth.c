@@ -34,12 +34,13 @@ typedef struct tfobj {
     };
 } tfobj;
 
+// Reader of the program
 typedef struct tfparser {
     char *prg;                      // Pointer to the entire program string to be compiled
     char *p;                        // Pointer to the current parsing position (next token to read)
 } tfparser;
 
-
+// Stack represented as tfctx (context) not as a simple list
 typedef struct tfctx {
     tfobj *stack;                   // The execution stack, represented as a Toy-Forth list object
 } tfctx;
@@ -47,14 +48,17 @@ typedef struct tfctx {
 // ALLOCATION WRAPPERS
 void *xmalloc(size_t size){
     void *ptr = malloc(size);       // Attempt to allocate the requested memory
-    if (ptr == NULL){
+    if (ptr == NULL){               // Instead of returning NULL it prints an ERROR
         fprintf(stderr, "Out of memory allocating %zu bytes\n", size);
         exit(1);
     }
     return ptr;                     // Return the successfully allocated memory pointer
 }
 
-// Allocate and initialize a new Toy-forth object (used to create different object types)
+/* 
+ * Allocate and initialize a new Toy-forth object 
+ * (The factory function used from all other functions to create different object types)
+ */
 tfobj *createObject(int type){
     tfobj *o = xmalloc(sizeof(tfobj));          // Allocate memory for the base object structure
     o->type = type;                             // Set the object's type discriminator
@@ -66,8 +70,10 @@ tfobj *createObject(int type){
 
 tfobj *createStringObject(char *s, size_t len){
     tfobj *o = createObject(TFOBJ_TYPE_STR);    // Create a base object of type String
-    o->str.ptr = s;                             // Assign the provided string pointer
+    o->str.ptr = xmalloc(len+1);                // Allocate a new, independent memory buffer (len + 1 for the null terminator)
     o->str.len = len;                           // Assign the provided string length
+    memcpy(o->str.ptr, s, len);                 // Copy the actual string data into the newly allocated buffer (safe duplication)
+    o->str.ptr[len] = 0;                        // 0 = null term '\0'
     return o;                                   // Return the new string object
 }
 
@@ -89,8 +95,6 @@ tfobj *createBoolObject(int i){
     return o;                                   // Return the new bool object
 }
 
-// LIST OBJECT
-
 tfobj *createListObject(){
     tfobj *o = createObject(TFOBJ_TYPE_LIST);   // Create a base object of type List
     o->list.element = NULL;                     // Initialize the element array pointer to NULL
@@ -98,9 +102,14 @@ tfobj *createListObject(){
     return o;                                   // Return the new list object
 }
 
-// Add the new element at the end of the list 'list'
-// It is up to the caller to increment the reference count of the
-// element added to the list, if needed
+/*
+ * Takes an object and appends it to the end of a list.
+ * It uses realloc to dynamically resize the pointer array:
+ *      if the list has 3 elements, it expands it to 4.
+ * Then it places the new element in the free position and increments the len counter.
+ *
+ * The caller should increment the reference count of the element added to the list, if needed
+ */
 void listPush(tfobj *list, tfobj *ele){
     list->list.element = realloc(list->list.element, sizeof(tfobj*) * (list->list.len + 1));
     list->list.element[list->list.len] = ele;
@@ -110,15 +119,11 @@ void listPush(tfobj *list, tfobj *ele){
 // TURN PROGRAM INTO TOY FORTH LIST
 
 /*
- * Advances the parser's pointer past any whitespace characters.
- * Stops at the first non-whitespace character or the end of the string.
+ * As long as the character under the pointer is a space, a tab, or a newline (isspace),
+ * it advances the pointer. It stops as soon as it encounters a character worth reading.
+ * The unsigned char cast: it prevents unexpected behavior with special or accented characters.
  */
 void parserSpaces(tfparser *parser){
-
-    /*
-     * As long as the character I'm currently on is a space,
-     * I increment the pointer and move on to the next character
-     */
      while(isspace((unsigned char)parser->p[0]))
         parser->p++;
 }
@@ -126,8 +131,15 @@ void parserSpaces(tfparser *parser){
 #define MAX_NUM_LEN 128
 
 /*
- * Parses a sequence of digits (with an optional leading minus sign)
- * and creates a new Integer object from it.
+ * It transforms a sequence of digits into an integer object.
+ * It marks the start of the number, accounts for an optional minus sign,
+ * and then advances as long as it encounters digits.
+ * It calculates the length by subtracting the pointers (end - start),
+ * copies the digits into a temporary buffer,
+ * appends the \0 terminator,
+ * and finally uses 'atoi' to convert the string into an actual integer,
+ * wrapping it in a 'tfobj'.
+ * The 'MAX_NUM_LEN' check prevents excessively long numbers from causing a buffer overflow
  */
 tfobj *parseNumber(tfparser *parser){
     char buf[MAX_NUM_LEN];
@@ -158,8 +170,36 @@ tfobj *parseNumber(tfparser *parser){
 }
 
 /*
- * Compiles the raw program string into a Toy-Forth List of objects.
- * Iterates through the text, tokenizes it, and pushes valid objects to the list.
+ * Checks whether a character is a letter (isalpha) or one of the basic operators
+ * Return true if the character 'c' is one of the character accettable for the our symbols
+ */
+char is_symbol(int c){
+    char symchars[] = "+-*/%";
+    return isalpha(c) || strchr(symchars, c) != NULL;
+}
+
+/*
+ * It reads all valid characters in a row and creates an object of type SYMBOL.
+ * This is the first step toward recognizing variables (ex: x, y) and operators in the language.
+ */
+tfobj *parseSymbol(tfparser *parser){
+    char *start = parser->p;
+
+    while(parser->p[0] && is_symbol(parser->p[0])) // we can omit the parser->p[0]
+        parser->p++;
+
+    int len = parser->p - start; 
+    return createSymbolObject(start, len);
+
+}
+
+/*
+ * It takes the raw text, creates an empty list, and begins iterating through it.
+ * For each position, it skips any spaces and checks whether the character is a digit or a minus sign;
+ * if it is, it calls 'parseNumber' to create the object.
+ * If the character is not recognized, it prints a syntax error and stops.
+ * Otherwise, it adds the object to the list using 'listPush'.
+ * Finally, it returns the list containing all the objects that were found.
  */
 tfobj *compile(char *prg){
     tfparser parser;
@@ -180,11 +220,13 @@ tfobj *compile(char *prg){
             break;
 
         // Check if the current token is a number (starts with a digit or minus sign)
-        if (isdigit (parser.p[0]) || parser.p[0] == '-'){
+        if (isdigit (parser.p[0]) || (parser.p[0] == '-' && isdigit(parser.p[1])))
             o = parseNumber(&parser);
-        } else {
-            o = NULL; // Unknown token type, will trigger syntax error
-        }
+        else if(is_symbol(parser.p[0]))
+            o = parseSymbol(&parser);
+        else 
+            o = NULL;
+        
 
         // Handle syntax errors for unrecognized tokens
         if (o == NULL){
@@ -197,30 +239,45 @@ tfobj *compile(char *prg){
     return parsed;
 }
 
-// EXECUTE THE PROGRAM
 
 /*
- * "Executes" the compiled program. 
- * Currently acts as a printer: iterates through the parsed objects 
- * and outputs their values to the console in a list format.
+ * If it encounters a list, it prints [, then calls itself (print_object) for each element inside, and finally prints ].
+ * This allows for the printing of nested lists of any depth (ex: [ 1 [ 2 3 ] 4 ]).
  */
-void exec(tfobj *prg){
-    printf("[");
-    for (size_t j = 0; j < prg->list.len; j++){
-        tfobj *o = prg->list.element[j];
-        switch(o->type){
-            case TFOBJ_TYPE_INT:
-                printf("%d", o->i);
-                break;
-            default:
-                printf("?");
-                break;
-        }
-        printf(" ");
+void print_object(tfobj *o){
+    switch(o->type){
+        case TFOBJ_TYPE_INT:
+            printf("%d", o->i);
+            break;
+        case TFOBJ_TYPE_LIST:
+            printf("[");
+            for (size_t j = 0; j < o->list.len; j++){
+                tfobj *element = o->list.element[j];
+                print_object(element); // recursion
+                printf(" ");
+            }
+            printf("]");
+            break;
+        case TFOBJ_TYPE_SYMBOL:
+              printf("%s", o->str.ptr);
+              break;
+        default:
+            printf("?");
+            break;
     }
-    printf("]\n");
 }
 
+/*
+ * The main verifies that exactly one file has been passed to it,
+ * opens that file in binary mode, determines its size (using `fseek` + `ftell`),
+ * allocates the appropriate amount of memory,
+ * reads the entire file in one go (`fread`),
+ * appends a `\0` terminator, and closes the file.
+ * It then calls `compile` to transform the text into a list of objects,
+ * passes that list to `exec` to print it,
+ * and finally frees the memory used for the raw text.
+ * The workflow is: read -> compile -> execute -> clean up
+ */
 int main(int argc, char **argv){
     if (argc != 2){                             // Check if exactly one command-line argument (the filename) is provided
         fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
@@ -277,8 +334,8 @@ int main(int argc, char **argv){
     fclose(fp);
 
     tfobj *prg = compile(prgtext);
-    exec(prg);
-
+    print_object(prg);
+    printf("\n");
     return 0;
 }
 
